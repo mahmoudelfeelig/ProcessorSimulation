@@ -1,0 +1,40 @@
+# Load immediate values
+MOVI R1 R0 5      # R1 = 5
+MOVI R2 R0 10     # R2 = 10
+MOVI R3 R0 0      # R3 = 0
+
+# ALU Operations
+ADD R4 R1 R2      # R4 = R1 + R2 -> 5 + 10 = 15
+SUB R5 R2 R1      # R5 = R2 - R1 -> 10 - 5 = 5
+MUL R6 R4 R1      # R6 = R4 * R1 -> 15 * 5 = 75
+AND R7 R1 R2      # R7 = R1 & R2 -> bitwise AND
+
+# Logical Shifts
+LSL R8 R1 1       # R8 = R1 << 1 (5 << 1 = 10)
+LSR R9 R2 1       # R9 = R2 >> 1 (10 >> 1 = 5)
+
+# XOR Immediate
+XORI R10 R2 3     # R10 = R2 XOR 3
+
+# Memory Operations
+MOVM R1 R0 0      # Store R1 into memory at address R0 + 0
+MOVM R2 R0 4      # Store R2 into memory at address R0 + 4
+MOVR R11 R0 0     # Load from memory at address R0 + 0 into R11
+MOVR R12 R0 4     # Load from memory at address R0 + 4 into R12
+
+# Control Flow
+JEQ R1 R1 2       # If R1 == R1, PC += 1 + 2 (jump 2 ahead, should jump)
+MOVI R13 R0 999   # (should be skipped if JEQ works)
+MOVI R14 R0 888   # (should be skipped if JEQ works)
+
+# After Jump Target
+MOVI R15 R0 777   # This should execute after JEQ
+
+# Absolute Jump
+JMP 1025          # Jump to address 1025
+
+# (At memory address 1025+)
+MOVI R16 R0 111   # R16 = 111 (test jump worked)
+
+# Final Store
+MOVM R16 R0 8     # Store R16 into memory at address R0 + 8
