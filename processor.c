@@ -1,343 +1,297 @@
+/* ────────────────────────────────────────────────
+ *  Five-stage pipelined CPU - 2-cycle DECODE & EX
+ *  Author:  (updated for 2025-05-21 request)
+ *  Stages: IF | ID(2) | EX(2) | MEM | WB
+ *  ------------------------------------------------
+ *  Build :  gcc -std=c11 -O2 processor.c -o cpu
+ *  Run   :  ./cpu            (expects program.txt)
+ * ────────────────────────────────────────────────*/
 #include <stdio.h>
 #include <stdint.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 
-#define MEMORY_SIZE 2048
-#define REGISTER_COUNT 32
+#define MEMORY_SIZE     2048
+#define REGISTER_COUNT  32
 
-// Memory: 2048 rows of 32 bits
+/* ─── Global state ─────────────────── */
 uint32_t memory[MEMORY_SIZE];
-// Registers: R0 - R31
 uint32_t registers[REGISTER_COUNT];
-// Program Counter (PC)
-uint32_t PC = 0;
-// Instruction memory count
-int instruction_count = 0;
+uint32_t PC              = 0;
+int      instruction_cnt = 0;
+int      globalCycle     = 0;
 
-// Struct for each stage in the pipeline
+/* ─── Pipeline stage structure ─────── */
 typedef struct {
-    uint32_t instruction;
-    int active;
+    /* raw instruction + timing */
+    uint32_t raw;
+    int      valid;          /* 1 = stage holds an instruction                */
+    int      stageCycle;     /* counts DOWN – remaining cycles *inside* stage */
+    /* decoded fields (only meaningful after decode) */
     int opcode;
     int r1, r2, r3;
-    int immediate;
-    int address;
+    int imm;
+    int addr;
     uint32_t aluResult;
-    uint32_t memoryData;
-} PipelineStage;
+    uint32_t memResult;
+} Stage;
 
-// Pipeline stages
-PipelineStage IF_stage, ID_stage, EX_stage, MEM_stage, WB_stage;
+/* ─── Five stages ───────────────────── */
+Stage IF, ID, EX, MEM, WB;
 
-// Map mnemonic to opcode
-int getOpcode(char* mnemonic) {
-    if (strcmp(mnemonic, "ADD") == 0)   return 0;
-    if (strcmp(mnemonic, "SUB") == 0)   return 1;
-    if (strcmp(mnemonic, "MUL") == 0)   return 2;
-    if (strcmp(mnemonic, "MOVI") == 0)  return 3;
-    if (strcmp(mnemonic, "JEQ") == 0)   return 4;
-    if (strcmp(mnemonic, "AND") == 0)   return 5;
-    if (strcmp(mnemonic, "XORI") == 0)  return 6;
-    if (strcmp(mnemonic, "JMP") == 0)   return 7;
-    if (strcmp(mnemonic, "LSL") == 0)   return 8;
-    if (strcmp(mnemonic, "LSR") == 0)   return 9;
-    if (strcmp(mnemonic, "MOVR") == 0)  return 10;
-    if (strcmp(mnemonic, "MOVM") == 0)  return 11;
+/* ─── Helpers ───────────────────────── */
+int getOpcode(const char *m) {
+    if (!strcmp(m, "ADD"))  return 0;
+    if (!strcmp(m, "SUB"))  return 1;
+    if (!strcmp(m, "MUL"))  return 2;
+    if (!strcmp(m, "MOVI")) return 3;
+    if (!strcmp(m, "JEQ"))  return 4;
+    if (!strcmp(m, "AND"))  return 5;
+    if (!strcmp(m, "XORI")) return 6;
+    if (!strcmp(m, "JMP"))  return 7;
+    if (!strcmp(m, "LSL"))  return 8;
+    if (!strcmp(m, "LSR"))  return 9;
+    if (!strcmp(m, "MOVR")) return 10;
+    if (!strcmp(m, "MOVM")) return 11;
     return -1;
 }
 
-// Initialize memory and registers
-void initialize() {
-    for (int i = 0; i < MEMORY_SIZE; i++) memory[i] = 0;
-    for (int i = 0; i < REGISTER_COUNT; i++) registers[i] = 0;
-    registers[0] = 0; // R0 is always 0
+void initialize(void) {
+    memset(memory,    0, sizeof(memory));
+    memset(registers, 0, sizeof(registers));
+    registers[0] = 0;      /* R0 hard-wired to 0 */
+    PC = 0;
 }
 
-// Print all registers
-void printRegisters() {
-    printf("\n=== Registers Dump ===\n");
-    for (int i = 0; i < REGISTER_COUNT; i++) {
-        printf("R%d: 0x%08X\n", i, registers[i]);
-    }
-    printf("PC: %u\n", PC);
-}
+/* ─── Assembly loader (plain text) ─── */
+void loadInstructions(const char *file) {
+    FILE *fp = fopen(file, "r");
+    if (!fp) { perror("open"); exit(1); }
 
-// Pretty print the pipeline stages (fixed-width columns)
-void printPipelineStages() {
-    printf("+-------+--------------------------------+\n");
-    printf("| Stage | Instruction                    |\n");
-    printf("+-------+--------------------------------+\n");
+    char line[128], mnem[8];
+    int  addr = 0;
+    while (fgets(line, sizeof line, fp)) {
 
-    printf("|  IF   | ");
-    if (IF_stage.active)
-        printf("0x%08X                 |\n", IF_stage.instruction);
-    else
-        printf("---                         |\n");
+        // comments removal logic
+        if (line[0] == ';' || line[0] == '\n' || line[0] == '\0') continue; // to skip comments in program.txt
+        char *comment = strchr(line, ';');
+        if (comment) *comment = '\0';
 
-    printf("|  ID   | ");
-    if (ID_stage.active)
-        printf("0x%08X                 |\n", ID_stage.instruction);
-    else
-        printf("---                         |\n");
+        int op, r1, r2, r3, imm, j;
+        uint32_t ins = 0;
+        if (sscanf(line, "%s", mnem) != 1) continue;
+        op  = getOpcode(mnem);
+        ins |= (op & 0xF) << 28;
 
-    printf("|  EX   | ");
-    if (EX_stage.active)
-        printf("0x%08X                 |\n", EX_stage.instruction);
-    else
-        printf("---                         |\n");
-
-    printf("|  MEM  | ");
-    if (MEM_stage.active)
-        printf("0x%08X                 |\n", MEM_stage.instruction);
-    else
-        printf("---                         |\n");
-
-    printf("|  WB   | ");
-    if (WB_stage.active)
-        printf("0x%08X                 |\n", WB_stage.instruction);
-    else
-        printf("---                         |\n");
-
-    printf("+-------+--------------------------------+\n");
-}
-
-// Print full instruction memory and only the non-zero data memory
-void printMemory() {
-    printf("\n=== Instruction Memory Dump ===\n");
-    for (int i = 0; i < instruction_count; i++) {
-        printf("Addr[%4d]: 0x%08X\n", i, memory[i]);
-    }
-
-    printf("\n=== Data Memory Dump (non-zero entries) ===\n");
-    int found = 0;
-    for (int i = instruction_count; i < MEMORY_SIZE; i++) {
-        if (memory[i] != 0) {
-            printf("Addr[%4d]: 0x%08X\n", i, memory[i]);
-            found = 1;
+        if (op <= 2 || op == 5 || op == 8 || op == 9) {          /* R-type / shift */
+            sscanf(line, "%*s R%d R%d R%d", &r1, &r2, &r3);
+            ins |= (r1 & 0x1F) << 23;
+            ins |= (r2 & 0x1F) << 18;
+            if (op == 8 || op == 9)
+                ins |= (r3 & 0x1FFF);
+            else
+                ins |= (r3 & 0x1F) << 13;
+        } else if (op == 7) {                                    /* JMP */
+            sscanf(line, "%*s %d", &j);
+            ins |= (j & 0x0FFFFFFF);
+        } else {                                                 /* I-type */
+            sscanf(line, "%*s R%d R%d %d", &r1, &r2, &imm);
+            ins |= (r1 & 0x1F) << 23;
+            ins |= (r2 & 0x1F) << 18;
+            ins |= (imm & 0x3FFFF);
         }
+        memory[addr++] = ins;
     }
-    if (!found) {
-        printf("  (all data memory is 0, as expected)\n");
+    fclose(fp);
+    instruction_cnt = addr;
+}
+
+/* ─── Decode helper ─────────────────── */
+void decode(Stage *s) {
+    uint32_t ins = s->raw;
+    s->opcode = (ins >> 28) & 0xF;
+
+    if (s->opcode <= 2 || s->opcode == 5 || s->opcode == 8 || s->opcode == 9) {
+        s->r1 = (ins >> 23) & 0x1F;
+        s->r2 = (ins >> 18) & 0x1F;
+        s->r3 = (ins >> 13) & 0x1F;
+    } else if (s->opcode == 7) {    /* JMP */
+        s->addr = ins & 0x0FFFFFFF;
+    } else {
+        s->r1  = (ins >> 23) & 0x1F;
+        s->r2  = (ins >> 18) & 0x1F;
+        s->imm = ins & 0x3FFFF;
+        if (s->imm & (1 << 17)) s->imm |= ~0x3FFFF;   /* sign-extend */
     }
 }
 
-// Load instructions from a file
-void loadInstructions(const char* filename) {
-    FILE* file = fopen(filename, "r");
-    if (!file) {
-        printf("Failed to open file: %s\n", filename);
-        exit(1);
-    }
-
-    char line[100];
-    int address = 0;
-    while (fgets(line, sizeof(line), file)) {
-        char mnemonic[10];
-        int opcode, reg1, reg2, reg3, immediate, address_field;
-        uint32_t instruction = 0;
-
-        sscanf(line, "%s", mnemonic);
-        opcode = getOpcode(mnemonic);
-        if (opcode == -1) {
-            printf("Unknown instruction: %s\n", mnemonic);
-            continue;
-        }
-
-        // Build the 32-bit instruction
-        instruction |= (opcode & 0xF) << 28;
-        if (opcode <= 2 || opcode == 5 || opcode == 8 || opcode == 9) {
-            // R-type or shift
-            sscanf(line, "%*s R%d R%d R%d", &reg1, &reg2, &reg3);
-            instruction |= (reg1 & 0x1F) << 23;
-            instruction |= (reg2 & 0x1F) << 18;
-            if (opcode == 8 || opcode == 9) {
-                instruction |= (reg3 & 0x1FFF);
-            } else {
-                instruction |= (reg3 & 0x1F) << 13;
+/* ─── Pretty printing ───────────────── */
+void printPipeline(void) {
+    printf("\n+-------+---------------------------+\n");
+    printf("| Stage | Instruction              |\n");
+    printf("+-------+---------------------------+\n");
+    const char *lab[5] = {"IF","ID","EX","MEM","WB"};
+    Stage *st[5] = {&IF,&ID,&EX,&MEM,&WB};
+    for (int i=0;i<5;i++) {
+        printf("| %-5s | ", lab[i]);
+        if (st[i]->valid) {
+            uint32_t raw = st[i]->raw;
+            int op  = (raw >> 28) & 0xF;
+            int r1  = (raw >> 23) & 0x1F;
+            int r2  = (raw >> 18) & 0x1F;
+            int r3  = (raw >> 13) & 0x1F;
+            int imm = raw & 0x3FFFF;
+            int adr = raw & 0x0FFFFFFF;
+            switch(op){
+                case 0:  printf("ADD  R%d R%d R%d",   r1,r2,r3); break;
+                case 1:  printf("SUB  R%d R%d R%d",   r1,r2,r3); break;
+                case 2:  printf("MUL  R%d R%d R%d",   r1,r2,r3); break;
+                case 3:  printf("MOVI R%d R%d %d",    r1,r2,(imm&(1<<17))?(imm|~0x3FFFF):imm); break;
+                case 4:  printf("JEQ  R%d R%d %d",    r1,r2,(imm&(1<<17))?(imm|~0x3FFFF):imm); break;
+                case 5:  printf("AND  R%d R%d R%d",   r1,r2,r3); break;
+                case 6:  printf("XORI R%d R%d %d",    r1,r2,(imm&(1<<17))?(imm|~0x3FFFF):imm); break;
+                case 7:  printf("JMP  %d",            adr); break;
+                case 8:  printf("LSL  R%d R%d %d",    r1,r2,r3); break;
+                case 9:  printf("LSR  R%d R%d %d",    r1,r2,r3); break;
+                case 10: printf("MOVR R%d R%d %d",    r1,r2,(imm&(1<<17))?(imm|~0x3FFFF):imm); break;
+                case 11: printf("MOVM R%d R%d %d",    r1,r2,(imm&(1<<17))?(imm|~0x3FFFF):imm); break;
+                default: printf("???"); break;
             }
-        } else if (opcode == 7) {
-            // Unconditional jump
-            sscanf(line, "%*s %d", &address_field);
-            instruction |= (address_field & 0x0FFFFFFF);
         } else {
-            // I-type
-            sscanf(line, "%*s R%d R%d %d", &reg1, &reg2, &immediate);
-            instruction |= (reg1 & 0x1F) << 23;
-            instruction |= (reg2 & 0x1F) << 18;
-            instruction |= (immediate & 0x3FFFF);
+            printf("---");
         }
-
-        memory[address++] = instruction;
+        printf("\n");
     }
-    fclose(file);
-    instruction_count = address;
+    printf("+-------+---------------------------+\n");
 }
 
-// Simulate the pipeline
-void simulatePipeline() {
-    int cycle = 1;
-    int instructionsRemaining = 1;
-    int fetchNext = 1;
-    int fetchControl = 0;
+void printRegisters(void) {
+    printf("\n=== Register Dump ===\n");
+    for (int i=0;i<REGISTER_COUNT;i++)
+        printf("R%-2d = %d\n", i, registers[i]);
+    printf("PC  = %d\n", PC);
+}
 
-    IF_stage.active = ID_stage.active = EX_stage.active = MEM_stage.active = WB_stage.active = 0;
+void printDataMem(void) {
+    printf("\n=== Data Memory Dump (non-zero entries) ===\n");
+    int nz = 0;
+    for (int i=instruction_cnt;i<MEMORY_SIZE;i++)
+        if (memory[i]) { printf("M[%d] = %d\n", i, memory[i]); nz=1; }
+    if (!nz) puts("(all data memory is 0)");
+}
 
-    while (instructionsRemaining > 0) {
-        printf("\nClock Cycle %d\n", cycle);
-        printPipelineStages();
+/* ─── Main simulation loop ─────────── */
+void simulate(void) {
+    int fetchStall = 0;          /* 2-cycle stall after branch */
+    int active     = 1;
 
-        // Print stage inputs
-        printf("Stage Inputs:\n");
-        if (IF_stage.active)  printf("  IF: instruction=0x%08X\n", IF_stage.instruction);
-        if (ID_stage.active)  printf("  ID: instruction=0x%08X, opcode=%d\n",
-                                   ID_stage.instruction, ID_stage.opcode);
-        if (EX_stage.active)  printf("  EX: opcode=%d, r1=R%d, r2=R%d, r3=R%d, imm=%d\n",
-                                   EX_stage.opcode, EX_stage.r1, EX_stage.r2,
-                                   EX_stage.r3, EX_stage.immediate);
-        if (MEM_stage.active) printf("  MEM: opcode=%d, aluResult=0x%08X\n",
-                                   MEM_stage.opcode, MEM_stage.aluResult);
-        if (WB_stage.active)  printf("  WB: opcode=%d, aluResult=0x%08X, memoryData=0x%08X\n",
-                                   WB_stage.opcode, WB_stage.aluResult, WB_stage.memoryData);
+    while (active) {
+        printf("\nClock Cycle %d\n", ++globalCycle);
 
-        // Write-Back Stage
-        if (WB_stage.active) {
-            if (WB_stage.opcode <= 2 || WB_stage.opcode == 3 || WB_stage.opcode == 5 ||
-                WB_stage.opcode == 6 || WB_stage.opcode == 8 || WB_stage.opcode == 9) {
-                if (WB_stage.r1 != 0) {
-                    registers[WB_stage.r1] = WB_stage.aluResult;
-                    printf("WB: Register R%u updated to 0x%08X\n",
-                           WB_stage.r1, WB_stage.aluResult);
-                } else {
-                    printf("WB: Write to R0 ignored\n");
+        /* ===== 1. WRITE-BACK ===== */
+        if (WB.valid) {
+            if (WB.opcode<=2 || WB.opcode==3 || WB.opcode==5 || WB.opcode==6 ||
+                WB.opcode==8 || WB.opcode==9) {
+                if (WB.r1) { registers[WB.r1] = WB.aluResult;
+                             printf("WB: R%d = %d\n", WB.r1, WB.aluResult);}
+            } else if (WB.opcode==10) {          /* load */
+                if (WB.r1) { registers[WB.r1] = WB.memResult;
+                             printf("WB: R%d loaded %d\n",WB.r1,WB.memResult);}
+            }
+            WB.valid = 0;
+        }
+
+        /* ===== 2. MEMORY ===== */
+        if (MEM.valid) {
+            if (MEM.opcode==10) {                         /* MOVR load */
+                MEM.memResult = memory[MEM.aluResult];
+            } else if (MEM.opcode==11) {                  /* MOVM store */
+                memory[MEM.aluResult] = registers[MEM.r1];
+                printf("MEM: M[%d] = %d\n", MEM.aluResult, registers[MEM.r1]);
+            }
+            WB = MEM; WB.valid = 1;
+            MEM.valid = 0;
+        }
+
+        /* ===== 3. EXECUTE ===== */
+        if (EX.valid) {
+            if (--EX.stageCycle == 0) {   /* finished 2-cycle latency */
+                int taken = 0;            /* branch flag            */
+                switch(EX.opcode){
+                    case 0:  EX.aluResult = registers[EX.r2] + registers[EX.r3]; break;
+                    case 1:  EX.aluResult = registers[EX.r2] - registers[EX.r3]; break;
+                    case 2:  EX.aluResult = registers[EX.r2] * registers[EX.r3]; break;
+                    case 3:  EX.aluResult = EX.imm;                                break;
+                    case 4:  if (registers[EX.r1]==registers[EX.r2]) {            /* JEQ */
+                                PC += 1 + EX.imm; taken=1; }
+                              break;
+                    case 5:  EX.aluResult = registers[EX.r2] & registers[EX.r3]; break;
+                    case 6:  EX.aluResult = registers[EX.r2] ^ EX.imm;            break;
+                    case 7:  PC = (PC & 0xF0000000) | EX.addr; taken=1;            break;
+                    case 8:  EX.aluResult = registers[EX.r2] << EX.r3;            break;
+                    case 9:  EX.aluResult = registers[EX.r2] >> EX.r3;            break;
+                    case 10:
+                    case 11: EX.aluResult = registers[EX.r2] + EX.imm;            break;
                 }
-            } else if (WB_stage.opcode == 10) {
-                if (WB_stage.r1 != 0) {
-                    registers[WB_stage.r1] = WB_stage.memoryData;
-                    printf("WB: Register R%u loaded from memory with value 0x%08X\n",
-                           WB_stage.r1, WB_stage.memoryData);
-                } else {
-                    printf("WB: Write to R0 ignored\n");
+                if (taken) {                     /* flush IF & ID, stall fetch 2 cycles */
+                    IF.valid = ID.valid = 0;
+                    fetchStall = 2;
+                    printf("Branch taken → flush IF/ID, PC=%d\n", PC);
                 }
+                MEM = EX; MEM.valid = 1;         /* send to MEM */
+                EX.valid = 0;
             }
-            WB_stage.active = 0;
         }
 
-        // Memory Stage
-        if (MEM_stage.active) {
-            if (MEM_stage.opcode == 10) {
-                MEM_stage.memoryData = memory[MEM_stage.aluResult];
-            } else if (MEM_stage.opcode == 11) {
-                memory[MEM_stage.aluResult] = registers[MEM_stage.r1];
-                printf("MEM: Memory[%u] updated to 0x%08X\n",
-                       MEM_stage.aluResult, registers[MEM_stage.r1]);
+        /* ===== 4. DECODE ===== */
+        if (ID.valid) {
+            if (--ID.stageCycle == 0 && !EX.valid) {      /* ready & EX free */
+                Stage tmp = ID;                           /* copy to tmp to decode */
+                decode(&tmp);
+                tmp.stageCycle = 2;
+                EX = tmp; EX.valid = 1;
+                ID.valid = 0;
             }
-            WB_stage = MEM_stage;
-            WB_stage.active = 1;
-            MEM_stage.active = 0;
         }
 
-        // Execute Stage (2-cycle execute simulated via fetchControl delays)
-        if (EX_stage.active) {
-            int branch_taken = 0;
-            switch (EX_stage.opcode) {
-                case 0: EX_stage.aluResult = registers[EX_stage.r2] + registers[EX_stage.r3]; break;
-                case 1: EX_stage.aluResult = registers[EX_stage.r2] - registers[EX_stage.r3]; break;
-                case 2: EX_stage.aluResult = registers[EX_stage.r2] * registers[EX_stage.r3]; break;
-                case 3: EX_stage.aluResult = EX_stage.immediate; break;
-                case 4: // Conditional branch
-                    if (registers[EX_stage.r1] == registers[EX_stage.r2]) {
-                        PC += 1 + EX_stage.immediate;
-                        branch_taken = 1;
-                    }
-                    break;
-                case 5: EX_stage.aluResult = registers[EX_stage.r2] & registers[EX_stage.r3]; break;
-                case 6: EX_stage.aluResult = registers[EX_stage.r2] ^ EX_stage.immediate; break;
-                case 7: // Unconditional jump
-                    PC = (PC & 0xF0000000) | EX_stage.address;
-                    branch_taken = 1;
-                    break;
-                case 8: EX_stage.aluResult = registers[EX_stage.r2] << EX_stage.r3; break;
-                case 9: EX_stage.aluResult = registers[EX_stage.r2] >> EX_stage.r3; break;
-                case 10:
-                case 11:
-                    EX_stage.aluResult = registers[EX_stage.r2] + EX_stage.immediate;
-                    break;
-            }
-            if (branch_taken) {
-                // Flush IF and ID, delay next fetch
-                fetchNext = 0;
-                fetchControl = 0;
-                IF_stage.active = 0;
-                ID_stage.active = 0;
-                printf("EX: Branch taken, flushing IF and ID, new PC=%u\n", PC);
-            }
-            MEM_stage = EX_stage;
-            MEM_stage.active = 1;
-            EX_stage.active = 0;
+        /* ===== 5. FETCH ===== */
+        if (fetchStall > 0) fetchStall--;
+        else if (!IF.valid && PC < instruction_cnt) {     /* fetch if slot free */
+            IF.raw   = memory[PC++];
+            IF.valid = 1;
         }
 
-        // Decode Stage
-        if (ID_stage.active) {
-            uint32_t instr = ID_stage.instruction;
-            ID_stage.opcode = (instr >> 28) & 0xF;
-            if (ID_stage.opcode <= 2 || ID_stage.opcode == 5 ||
-                ID_stage.opcode == 8 || ID_stage.opcode == 9) {
-                ID_stage.r1 = (instr >> 23) & 0x1F;
-                ID_stage.r2 = (instr >> 18) & 0x1F;
-                ID_stage.r3 = (instr >> 13) & 0x1F;
-            } else if (ID_stage.opcode == 7) {
-                ID_stage.address = instr & 0x0FFFFFFF;
-            } else {
-                ID_stage.r1 = (instr >> 23) & 0x1F;
-                ID_stage.r2 = (instr >> 18) & 0x1F;
-                int imm = instr & 0x3FFFF;
-                // Sign-extend 18-bit immediate
-                if (imm & (1 << 17)) imm |= ~0x3FFFF;
-                ID_stage.immediate = imm;
-            }
-            EX_stage = ID_stage;
-            EX_stage.active = 1;
-            ID_stage.active = 0;
+        /* ===== 6. IF → ID transfer (next cycle only) === */
+        static int firstCycleComplete = 0;
+        if (firstCycleComplete && IF.valid && !ID.valid) {
+            ID = IF;
+            ID.valid = 1;
+            ID.stageCycle = 2;
+            IF.valid = 0;
         }
+        firstCycleComplete = 1;
 
-        // Fetch Stage
-        if (fetchNext && PC < instruction_count) {
-            IF_stage.instruction = memory[PC++];
-            IF_stage.active = 1;
-            fetchNext = 0;
-        }
-        if (IF_stage.active) {
-            ID_stage = IF_stage;
-            ID_stage.active = 1;
-            IF_stage.active = 0;
-        }
 
-        // Advance cycle counters
-        cycle++;
-        fetchControl++;
-        if (fetchControl == 2) {
-            // Simulate 2-cycle execute delay
-            fetchNext = 1;
-            fetchControl = 0;
-        }
+        /* ===== Print pipeline & registers ============= */
+        printPipeline();
+        printRegisters();
 
-        // Termination: no active stages & PC past last instruction
-        if (!IF_stage.active && !ID_stage.active &&
-            !EX_stage.active && !MEM_stage.active &&
-            !WB_stage.active && PC >= instruction_count) {
-            instructionsRemaining = 0;
-        }
+        /* ===== Termination check ====================== */
+        if (!IF.valid && !ID.valid && !EX.valid &&
+            !MEM.valid && !WB.valid &&
+            PC >= instruction_cnt && fetchStall==0)
+            active = 0;
     }
 }
 
-int main() {
+/* ─── main ─────────────────────────── */
+int main(void) {
     initialize();
     loadInstructions("program.txt");
-    printf("\n=== Starting Simulation ===\n");
-    simulatePipeline();
-    printf("\n=== Simulation Complete ===\n");
+    puts("\n=== Starting Pipeline Simulation ===");
+    simulate();
+    puts("\n=== Simulation Complete ===");
     printRegisters();
-    printMemory();
+    printDataMem();
     return 0;
 }
