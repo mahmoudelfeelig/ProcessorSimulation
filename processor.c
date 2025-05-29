@@ -1,11 +1,3 @@
-/* ────────────────────────────────────────────────
- *  Five-stage pipelined CPU - 2-cycle DECODE & EX
- *  Author:  (updated for 2025-05-21 request)
- *  Stages: IF | ID(2) | EX(2) | MEM | WB
- *  ------------------------------------------------
- *  Build :  gcc -std=c11 -O2 processor.c -o cpu
- *  Run   :  ./cpu            (expects program.txt)
- * ────────────────────────────────────────────────*/
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
